@@ -780,10 +780,14 @@ def remove_text_only(page):
 TEXT_FLAGS = fitz.TEXT_PRESERVE_WHITESPACE | fitz.TEXT_PRESERVE_LIGATURES | fitz.TEXT_MEDIABOX_CLIP
 
 
+MERGE_GAP = 0.2  # доля кегля: меньше ширины пробела — куски одной строки после прошлой правки
+
+
 def text_lines(page):
     """Визуальные строки страницы со всеми фрагментами (span) — у каждого свой шрифт/размер/цвет.
-    Куски одной строки на общей базовой линии склеиваются (например, после прошлой правки),
-    а далеко разнесённые (колонки таблиц) остаются отдельными строками."""
+    Склеиваются только куски, стоящие вплотную на одной базовой линии (так выглядит строка
+    после прошлой правки). Всё, что разделено хотя бы пробелом, остаётся отдельными строками —
+    например, соседние даты или ячейки таблицы."""
     raw = []
     for b in page.get_text("dict", flags=TEXT_FLAGS)["blocks"]:
         if b.get("type") != 0:
@@ -819,7 +823,7 @@ def text_lines(page):
         cur = None
         for ln in g:
             size = min(sp["size"] for sp in ln["spans"])
-            if cur is not None and ln["a0"] - cur["a1"] < 1.5 * size:
+            if cur is not None and ln["a0"] - cur["a1"] < MERGE_GAP * size:
                 cur["spans"] += ln["spans"]
                 cur["a1"] = max(cur["a1"], ln["a1"])
             else:
@@ -834,6 +838,26 @@ def text_lines(page):
             ln["bbox"] |= fitz.Rect(sp["bbox"])
         ln["raw"] = "".join(sp["text"] for sp in ln["spans"])
     return out
+
+def pick_line(page, pt):
+    """Строка под щелчком. Среди фрагментов, в рамку которых попала точка, выбирается тот,
+    в полосу букв которого (от базовой линии до высоты прописных) она попала точнее всего.
+    Рамки соседних строк часто перекрываются, поэтому одной рамки недостаточно."""
+    best, best_score = None, None
+    for ln in text_lines(page):
+        dx, dy = ln["dir"]
+        for sp in ln["spans"]:
+            if not sp["text"].strip() or not (fitz.Rect(sp["bbox"]) + (-1, -1, 1, 1)).contains(pt):
+                continue
+            ox, oy = sp["origin"]
+            size = sp["size"]
+            perp = -dy * (pt.x - ox) + dx * (pt.y - oy)  # >0 — ниже базовой линии
+            top, bottom = -0.75 * size, 0.1 * size
+            dist = 0.0 if top <= perp <= bottom else min(abs(perp - top), abs(perp - bottom))
+            score = dist / size
+            if best_score is None or score < best_score:
+                best, best_score = ln, score
+    return best
 
 
 # ------------------------------------------------------------------ диалоги --
@@ -971,6 +995,19 @@ class PageView(QGraphicsView):
         self.temp = None
         self.start = None
         self.points = []
+
+    def mark(self, rect):
+        """Подсветка области (координаты страницы на экране, без масштаба)."""
+        self.unmark()
+        z = self.ed.zoom
+        self._mark = self.scene().addRect(QRectF(rect.x0 * z, rect.y0 * z, rect.width * z, rect.height * z),
+                                          QPen(QColor(0, 120, 215), 1.5), QBrush(QColor(0, 120, 215, 50)))
+        self.ensureVisible(self._mark)
+
+    def unmark(self):
+        if getattr(self, "_mark", None) is not None:
+            self.scene().removeItem(self._mark)
+            self._mark = None
 
     def set_page_pixmap(self, pm, w, h):
         self.pix_item.setPixmap(pm)
@@ -1649,8 +1686,7 @@ class Editor(QMainWindow):
 
     def edit_line_at(self, pt):
         page = self._page()
-        hits = [ln for ln in text_lines(page) if ln["bbox"].contains(pt)]
-        line = min(hits, key=lambda ln: abs(pt - (ln["bbox"].tl + ln["bbox"].br) / 2)) if hits else None
+        line = pick_line(page, pt)
         if line is None:
             self.statusBar().showMessage(
                 "Под курсором нет текста. Если это скан (картинка), текст изменить нельзя — "
@@ -1667,7 +1703,12 @@ class Editor(QMainWindow):
             hint += "\n⚠ В строке есть нечитаемые символы (�) — они не сохранятся."
         dlg = TextDialog(self, "Изменить строку", raw.strip(), s0["size"], int_to_rgb(s0["color"]),
                          "orig", bold, italic, hint=hint, original=s0["font"])
-        if dlg.exec() != QDialog.Accepted:
+        self.view.mark(line["bbox"] * page.rotation_matrix)  # видно, какая строка выбрана
+        try:
+            accepted = dlg.exec() == QDialog.Accepted
+        finally:
+            self.view.unmark()
+        if not accepted:
             return
         v = dlg.values()
         same_look = (v["family"] == "orig" and v["size"] == round(s0["size"], 1)
