@@ -7,10 +7,14 @@ PDF Редактор — настольный редактор PDF для Window
 Запуск:   python pdf_editor.py [файл.pdf]
 Сборка:   см. build_exe.bat
 """
+import difflib
 import math
 import os
+import re
+import struct
 import sys
 import tempfile
+import zlib
 
 try:
     import pymupdf as fitz
@@ -45,8 +49,11 @@ ART_NONE = getattr(fitz, "PDF_REDACT_LINE_ART_NONE", 0)
 ART_COVERED = getattr(fitz, "PDF_REDACT_LINE_ART_REMOVE_IF_COVERED", 1)
 
 # ----------------------------------------------------------------- шрифты --
-# Встроенные шрифты PDF (Helvetica и т.п.) не умеют кириллицу как следует,
-# поэтому берём TTF из системы: на Windows — Arial / Times New Roman / Courier New.
+# Порядок выбора шрифта при правке существующего текста:
+#   1) исходный шрифт из самого PDF — пишем коды его глифов напрямую (через карту ToUnicode),
+#      шрифт не перевкладывается; работает, если все нужные буквы есть в урезанном (subset) шрифте;
+#   2) установленный в системе шрифт с тем же именем (Calibri, Times New Roman, Arial…);
+#   3) замена по признакам: Arial / Times New Roman / Courier New.
 FONT_DIRS = [
     os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "Fonts"),
     os.path.join(os.environ.get("LOCALAPPDATA", ""), "Microsoft", "Windows", "Fonts"),
@@ -72,11 +79,12 @@ FAMILIES = [("sans", "Arial (без засечек)"),
             ("serif", "Times New Roman (с засечками)"),
             ("mono", "Courier New (моноширинный)")]
 BASE14 = {"sans": "helv", "serif": "tiro", "mono": "cour"}
+ROT_DIR = {0: (1, 0), 90: (0, -1), 180: (-1, 0), 270: (0, 1)}  # /Rotate -> направление строки
 _font_cache = {}
 
 
 def find_font(family, bold=False, italic=False):
-    """Путь к TTF-файлу нужного начертания или None."""
+    """Путь к TTF нужного начертания (для замены) или None."""
     key = (family, int(bool(bold)), int(bool(italic)))
     if key in _font_cache:
         return _font_cache[key]
@@ -90,21 +98,629 @@ def find_font(family, bold=False, italic=False):
         if path:
             break
     if path is None and (bold or italic):
-        path = find_font(family)  # нет жирного/курсива — берём обычный
+        path = find_font(family)
     _font_cache[key] = path
     return path
 
 
-def put_text(page, point, text, size, color, family="sans", bold=False, italic=False, rotate=0):
-    """Вставляет текст. point — начало базовой линии в координатах страницы (без учёта /Rotate)."""
+def norm_font_name(name):
+    """'ABCDEF+TimesNewRomanPS-BoldMT', 'Times New Roman Bold' -> 'timesnewromanbold'."""
+    name = (name or "").split("+", 1)[-1]
+    name = re.sub(r"[-,]?Identity-[HV]$", "", name)
+    parts = re.split(r"[\s,\-_]+", name)
+    s = "".join(re.sub(r"PS$", "", re.sub(r"MT$", "", p)) for p in parts).lower()
+    for w, r in (("oblique", "italic"), ("regular", ""), ("normal", ""), ("book", "")):
+        s = s.replace(w, r)
+    return s
+
+
+def _font_file_names(path):
+    """Имена шрифта из таблицы 'name' TTF/OTF/TTC (полное, PostScript, семейство+начертание)."""
+    try:
+        with open(path, "rb") as f:
+            head = f.read(12)
+            if head[:4] == b"ttcf":
+                f.seek(12)
+                f.seek(struct.unpack(">I", f.read(4))[0])
+                head = f.read(12)
+            ntab = struct.unpack(">H", head[4:6])[0]
+            dirs = f.read(16 * ntab)
+            for i in range(ntab):
+                tag, _, off, ln = struct.unpack(">4sIII", dirs[16 * i:16 * i + 16])
+                if tag == b"name":
+                    f.seek(off)
+                    tbl = f.read(ln)
+                    break
+            else:
+                return []
+        _, count, soff = struct.unpack(">HHH", tbl[:6])
+        found = {}
+        for i in range(count):
+            pid, eid, lid, nid, ln, off = struct.unpack(">6H", tbl[6 + 12 * i:18 + 12 * i])
+            if nid not in (1, 2, 4, 6):
+                continue
+            raw = tbl[soff + off:soff + off + ln]
+            if pid in (0, 3):
+                s, score = raw.decode("utf-16-be", "ignore"), (2 if lid == 0x409 else 1)
+            elif pid == 1 and eid == 0:
+                s, score = raw.decode("latin-1", "ignore"), 0
+            else:
+                continue
+            if nid not in found or score > found[nid][1]:
+                found[nid] = (s, score)
+        names = [found[k][0] for k in (4, 6) if k in found]
+        if 1 in found:
+            names.append(found[1][0] + " " + (found[2][0] if 2 in found else ""))
+        return names
+    except Exception:
+        return []
+
+
+_sys_index = None
+
+
+def system_font_path(name):
+    """Ищет установленный шрифт по имени из PDF. Индекс строится один раз за запуск."""
+    global _sys_index
+    if _sys_index is None:
+        _sys_index = {}
+        for d in FONT_DIRS:
+            if not d or not os.path.isdir(d):
+                continue
+            for fn in sorted(os.listdir(d)):
+                if fn.lower().endswith((".ttf", ".otf", ".ttc")):
+                    p = os.path.join(d, fn)
+                    for n in _font_file_names(p):
+                        _sys_index.setdefault(norm_font_name(n), p)
+    return _sys_index.get(norm_font_name(name))
+
+
+# ------------------------------------------------- PDF-уровень: CMap, ширины --
+def _utf16(hexstr):
+    return bytes.fromhex(hexstr).decode("utf-16-be", "ignore")
+
+
+def parse_tounicode(data):
+    """CMap ToUnicode -> {код глифа (bytes): текст}."""
+    text = data.decode("latin-1", "ignore")
+    m = {}
+    for block in re.findall(r"beginbfchar(.*?)endbfchar", text, re.S):
+        for src, dst in re.findall(r"<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]*)>", block):
+            m[bytes.fromhex(src)] = _utf16(dst)
+    for block in re.findall(r"beginbfrange(.*?)endbfrange", text, re.S):
+        for lo, hi, rest in re.findall(r"<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>\s*(<[0-9A-Fa-f]*>|\[[^\]]*\])", block):
+            lo_i, hi_i, n = int(lo, 16), int(hi, 16), len(lo) // 2
+            if hi_i - lo_i > 65535:
+                continue
+            if rest.startswith("["):
+                for i, dst in enumerate(re.findall(r"<([0-9A-Fa-f]*)>", rest)):
+                    m[(lo_i + i).to_bytes(n, "big")] = _utf16(dst)
+            else:
+                dst = rest[1:-1]
+                base, dn = int(dst, 16), max(1, len(dst) // 2)
+                for code in range(lo_i, hi_i + 1):
+                    try:
+                        m[code.to_bytes(n, "big")] = (base + code - lo_i).to_bytes(dn, "big").decode("utf-16-be", "ignore")
+                    except OverflowError:
+                        break
+    return m
+
+
+def _numbers(s):
+    return [float(x) for x in re.findall(r"[-+]?\d*\.?\d+", s)]
+
+
+def parse_cid_widths(s):
+    """Массив /W CID-шрифта: 'c [w1 w2 …]' или 'c1 c2 w'."""
+    toks = re.findall(r"\[|\]|[-+]?\d*\.?\d+", s)
+    if toks and toks[0] == "[":
+        toks = toks[1:-1]
+    out, i = {}, 0
+    try:
+        while i < len(toks):
+            c = int(float(toks[i]))
+            i += 1
+            if toks[i] == "[":
+                i += 1
+                while toks[i] != "]":
+                    out[c] = float(toks[i])
+                    c += 1
+                    i += 1
+                i += 1
+            else:
+                c2, w = int(float(toks[i])), float(toks[i + 1])
+                i += 2
+                for j in range(c, min(c2, c + 65535) + 1):
+                    out[j] = w
+    except (IndexError, ValueError):
+        pass
+    return out
+
+
+def _obj_text(doc, kind, value):
+    """Значение ключа; если это ссылка — текст самого объекта."""
+    if kind == "xref":
+        return doc.xref_object(int(value.split()[0]), compressed=True)
+    return value
+
+
+class TTFInfo:
+    """Минимальный разбор TrueType: есть ли у глифа контур (таблица loca) и код -> глиф (cmap).
+    Нужен потому, что урезанные шрифты часто сохраняют «пустые» глифы-заглушки."""
+
+    def __init__(self, buf):
+        self.ok, self.buf, self.cmaps = False, buf, {}
+        try:
+            if buf[:4] not in (b"\x00\x01\x00\x00", b"true"):
+                return  # CFF/OpenType-CFF — не TrueType
+            tables = {}
+            for i in range(struct.unpack(">H", buf[4:6])[0]):
+                tag, _, off, ln = struct.unpack(">4sIII", buf[12 + 16 * i:28 + 16 * i])
+                tables[tag] = off
+            fmt = struct.unpack(">h", buf[tables[b"head"] + 50:tables[b"head"] + 52])[0]
+            self.n = struct.unpack(">H", buf[tables[b"maxp"] + 4:tables[b"maxp"] + 6])[0]
+            lo = tables[b"loca"]
+            if fmt == 0:
+                self.loca = [2 * x for x in struct.unpack(">%dH" % (self.n + 1), buf[lo:lo + 2 * (self.n + 1)])]
+            else:
+                self.loca = list(struct.unpack(">%dI" % (self.n + 1), buf[lo:lo + 4 * (self.n + 1)]))
+            co = tables.get(b"cmap")
+            if co is not None:
+                for i in range(struct.unpack(">H", buf[co + 2:co + 4])[0]):
+                    pid, eid, off = struct.unpack(">HHI", buf[co + 4 + 8 * i:co + 12 + 8 * i])
+                    self.cmaps[(pid, eid)] = co + off
+            self.ok = True
+        except Exception:
+            self.ok = False
+
+    def has_outline(self, gid):
+        return 0 < gid < self.n and self.loca[gid + 1] > self.loca[gid]
+
+    def gid_for_code(self, code):
+        """Код простого TrueType-шрифта -> номер глифа (символьная (3,0) или Mac (1,0) таблица)."""
+        for key, cps in (((3, 0), (0xF000 + code, code)), ((1, 0), (code,)), ((3, 1), (code,))):
+            if key in self.cmaps:
+                for cp in cps:
+                    g = self._lookup(self.cmaps[key], cp)
+                    if g:
+                        return g
+        return 0
+
+    def _lookup(self, off, cp):
+        b = self.buf
+        try:
+            fmt = struct.unpack(">H", b[off:off + 2])[0]
+            if fmt == 0:
+                return b[off + 6 + cp] if cp < 256 else 0
+            if fmt == 6:
+                first, cnt = struct.unpack(">HH", b[off + 6:off + 10])
+                if first <= cp < first + cnt:
+                    return struct.unpack(">H", b[off + 10 + 2 * (cp - first):off + 12 + 2 * (cp - first)])[0]
+                return 0
+            if fmt == 4:
+                segx2 = struct.unpack(">H", b[off + 6:off + 8])[0]
+                segs = segx2 // 2
+                ends = struct.unpack(">%dH" % segs, b[off + 14:off + 14 + segx2])
+                starts = struct.unpack(">%dH" % segs, b[off + 16 + segx2:off + 16 + 2 * segx2])
+                deltas = struct.unpack(">%dh" % segs, b[off + 16 + 2 * segx2:off + 16 + 3 * segx2])
+                ro = off + 16 + 3 * segx2
+                ranges = struct.unpack(">%dH" % segs, b[ro:ro + segx2])
+                for i in range(segs):
+                    if starts[i] <= cp <= ends[i]:
+                        if ranges[i] == 0:
+                            return (cp + deltas[i]) & 0xFFFF
+                        a = ro + 2 * i + ranges[i] + 2 * (cp - starts[i])
+                        g = struct.unpack(">H", b[a:a + 2])[0]
+                        return (g + deltas[i]) & 0xFFFF if g else 0
+        except (struct.error, IndexError):
+            pass
+        return 0
+
+
+class GlyphFont:
+    """Шрифт, уже встроенный в PDF. Текст пишется кодами его глифов — выглядит как оригинал."""
+    kind = "orig"
+
+    def __init__(self, doc, xref, basefont):
+        self.xref = xref
+        self.label = basefont.split("+", 1)[-1]
+        self.rev, self.widths, self.dw, self.nbytes = {}, {}, 1000.0, 1
+        try:
+            self.ok = self._load(doc)
+        except Exception:
+            self.ok = False
+
+    def _load(self, doc):
+        x = self.xref
+        sub = doc.xref_get_key(x, "Subtype")[1]
+        if sub == "/Type0":
+            if doc.xref_get_key(x, "Encoding")[1] != "/Identity-H":
+                return False
+            self.nbytes = 2
+            m = re.search(r"(\d+)\s+0\s+R", doc.xref_get_key(x, "DescendantFonts")[1])
+            if not m:
+                return False
+            desc = int(m.group(1))
+            k, v = doc.xref_get_key(desc, "DW")
+            if k in ("int", "float"):
+                self.dw = float(v)
+            k, v = doc.xref_get_key(desc, "W")
+            if k in ("array", "xref"):
+                self.widths = parse_cid_widths(_obj_text(doc, k, v))
+        elif sub in ("/TrueType", "/Type1", "/MMType1"):
+            k, fc = doc.xref_get_key(x, "FirstChar")
+            k2, w = doc.xref_get_key(x, "Widths")
+            if k not in ("int", "float") or k2 not in ("array", "xref"):
+                return False
+            first = int(float(fc))
+            self.widths = {first + i: v for i, v in enumerate(_numbers(_obj_text(doc, k2, w)))}
+            k, v = doc.xref_get_key(x, "FontDescriptor/MissingWidth")
+            self.dw = float(v) if k in ("int", "float") else 0.0
+        else:
+            return False  # Type3 и экзотика
+        k, v = doc.xref_get_key(x, "ToUnicode")
+        if k != "xref":
+            return False
+        for code, s in sorted(parse_tounicode(doc.xref_stream(int(v.split()[0]))).items()):
+            if len(code) == self.nbytes and len(s) == 1:
+                self.rev.setdefault(s, code)
+        self._setup_verify(doc, sub)
+        return bool(self.rev)
+
+    def _setup_verify(self, doc, sub):
+        """Как проверить, что у буквы в урезанном шрифте реально есть контур."""
+        self._checked = {}
+        try:
+            buf = doc.extract_font(self.xref)[3]
+        except Exception:
+            buf = b""
+        if not buf:  # шрифт не встроен — его рисует просмотрщик полным системным шрифтом
+            self._verify = lambda code, ch: True
+            return
+        tt = TTFInfo(buf)
+        if tt.ok:
+            if sub == "/Type0":
+                gid_map = None
+                m = re.search(r"(\d+)\s+0\s+R", doc.xref_get_key(self.xref, "DescendantFonts")[1])
+                k, v = doc.xref_get_key(int(m.group(1)), "CIDToGIDMap")
+                if k == "xref":
+                    gid_map = doc.xref_stream(int(v.split()[0]))
+
+                def cid2gid(cid):
+                    if gid_map is None:
+                        return cid
+                    return int.from_bytes(gid_map[2 * cid:2 * cid + 2], "big") if 2 * cid + 2 <= len(gid_map) else 0
+                self._verify = lambda code, ch: tt.has_outline(cid2gid(int.from_bytes(code, "big")))
+            else:
+                self._verify = lambda code, ch: tt.has_outline(tt.gid_for_code(code[0]))
+            return
+        try:  # CFF / Type1: FreeType строит таблицу символов по именам глифов
+            ft = fitz.Font(fontbuffer=buf)
+            self._verify = lambda code, ch: ft.has_glyph(ord(ch)) != 0
+        except Exception:
+            self._verify = lambda code, ch: False
+
+    def _has(self, ch):
+        if ch not in self._checked:
+            code = self.rev.get(ch)
+            self._checked[ch] = code is not None and bool(self._verify(code, ch))
+        return self._checked[ch]
+
+    def missing(self, text):
+        return sorted({c for c in text if not c.isspace() and not self._has(c)})
+
+    def _tj(self, text):
+        """Текст -> куски для оператора TJ. Нет глифа пробела — пробел делаем сдвигом."""
+        parts, cur = [], b""
+        for ch in text:
+            code = self.rev.get(ch)
+            if code is None:
+                if ch in " \u00a0":
+                    code = self.rev.get(" ")
+                    if code is None:
+                        if cur:
+                            parts.append(cur)
+                            cur = b""
+                        parts.append(-250.0)
+                        continue
+                else:
+                    return None
+            cur += code
+        if cur:
+            parts.append(cur)
+        return parts
+
+    def width(self, text, size):
+        w, n = 0.0, self.nbytes
+        for p in self._tj(text) or []:
+            if isinstance(p, float):
+                w -= p
+            else:
+                w += sum(self.widths.get(int.from_bytes(p[i:i + n], "big"), self.dw) for i in range(0, len(p), n))
+        return w / 1000.0 * size
+
+    def draw_line(self, page, batch, pt, text, size, color, d):
+        parts = self._tj(text)
+        tj = " ".join(("%.2f" % p) if isinstance(p, float) else "<%s>" % p.hex() for p in parts)
+        batch.add(self.xref, pt * ~page.transformation_matrix, d, size, color, tj)
+        return False  # новый шрифт не вкладывался
+
+
+class FileFont:
+    """TTF-файл: установленный шрифт с тем же именем или замена (Arial/Times/Courier)."""
+
+    def __init__(self, path, kind):
+        self.path, self.kind = path, kind
+        self.font = fitz.Font(fontfile=path)
+        self.label = self.font.name
+
+    def missing(self, text):
+        return sorted({c for c in text if c not in "\n" and not self.font.has_glyph(ord(c))})
+
+    def width(self, text, size):
+        return self.font.text_length(text, fontsize=size)
+
+    def draw_line(self, page, batch, pt, text, size, color, d):
+        name = "S%s%06x" % (SESSION, zlib.crc32(self.path.encode("utf-8")) & 0xFFFFFF)
+        page.insert_text(pt, text, fontname=name, fontfile=self.path, fontsize=size,
+                         color=color, rotate=rotate_from_dir(d))
+        return True
+
+
+class Base14Font:
+    """Крайний случай, если в системе вообще нет подходящих TTF."""
+    kind = "generic"
+
+    def __init__(self, family):
+        self.fn = BASE14[family]
+        self.label = {"helv": "Helvetica", "tiro": "Times", "cour": "Courier"}[self.fn]
+
+    def missing(self, text):
+        return []
+
+    def width(self, text, size):
+        return fitz.get_text_length(text, fontname=self.fn, fontsize=size, encoding=fitz.TEXT_ENCODING_CYRILLIC)
+
+    def draw_line(self, page, batch, pt, text, size, color, d):
+        page.insert_text(pt, text, fontname=self.fn, fontsize=size, color=color,
+                         rotate=rotate_from_dir(d), encoding=fitz.TEXT_ENCODING_CYRILLIC)
+        return False
+
+
+_file_fonts = {}
+
+
+def file_font(path, kind):
+    key = (path, kind)
+    if key not in _file_fonts:
+        _file_fonts[key] = FileFont(path, kind)
+    return _file_fonts[key]
+
+
+def generic_font(family, bold=False, italic=False):
     path = find_font(family, bold, italic)
-    kw = dict(fontsize=size, color=color, rotate=rotate)
-    if path:
-        fname = "E%s%s%d%d" % (SESSION, {"sans": "A", "serif": "T", "mono": "C"}[family], int(bold), int(italic))
-        page.insert_text(point, text, fontname=fname, fontfile=path, **kw)
-    else:  # запасной вариант: встроенный шрифт с кириллической кодировкой
-        page.insert_text(point, text, fontname=BASE14[family],
-                         encoding=fitz.TEXT_ENCODING_CYRILLIC, **kw)
+    return file_font(path, "generic") if path else Base14Font(family)
+
+
+def draw_text(spec, page, batch, pt, text, size, color, d):
+    """Многострочный текст от базовой линии pt в направлении d. True — если вкладывался шрифт."""
+    normal = fitz.Point(-d[1], d[0])
+    embedded = False
+    for i, ln in enumerate(text.split("\n")):
+        if ln.strip():
+            embedded |= bool(spec.draw_line(page, batch, fitz.Point(pt) + normal * (i * size * 1.2),
+                                            ln, size, color, d))
+    return embedded
+
+
+def put_text(page, point, text, size, color, family="sans", bold=False, italic=False, rotate=0):
+    """Новый текст (инструмент «Текст»). point — базовая линия в координатах без учёта /Rotate."""
+    batch = TextBatch(page)
+    draw_text(generic_font(family, bold, italic), page, batch, point, text, size, color, ROT_DIR[rotate % 360])
+    batch.flush()
+
+
+class TextBatch:
+    """Копит операторы вывода текста исходными шрифтами и дописывает их одним потоком."""
+
+    def __init__(self, page):
+        self.page, self.items = page, []
+
+    def add(self, xref, pdf_pt, d, size, color, tj):
+        self.items.append((xref, pdf_pt, d, size, color, tj))
+
+    def flush(self):
+        if not self.items:
+            return
+        page, doc = self.page, self.page.parent
+        names = {}
+        for it in self.items:
+            if it[0] not in names:
+                names[it[0]] = ensure_font_resource(doc, page, it[0])
+        if not page.is_wrapped:
+            page.wrap_contents()  # q…Q вокруг старого содержимого: его трансформации нас не заденут
+        out = []
+        for xref, p, (dx, dy), size, (r, g, b), tj in self.items:
+            out.append("q %.4f %.4f %.4f rg BT /%s %.3f Tf %.5f %.5f %.5f %.5f %.3f %.3f Tm [%s] TJ ET Q"
+                       % (r, g, b, names[xref], size, dx, -dy, dy, dx, p.x, p.y, tj))
+        append_contents(doc, page, ("\n".join(out) + "\n").encode("latin-1"))
+        self.items = []
+
+
+def ensure_font_resource(doc, page, xref):
+    """Имя шрифта в ресурсах страницы; если его там нет (шрифт жил в XObject) — добавляем."""
+    for f in page.get_fonts(full=True):
+        if f[0] == xref and f[6] == 0:
+            return f[4]
+    name = "R%s%d" % (SESSION, xref)
+    k, v = doc.xref_get_key(page.xref, "Resources")
+    if k == "xref":
+        target, path = int(v.split()[0]), "Font"
+    elif k == "dict":
+        target, path = page.xref, "Resources/Font"
+    else:
+        raise RuntimeError("у страницы унаследованные ресурсы — исходный шрифт недоступен")
+    k2, v2 = doc.xref_get_key(target, path)
+    if k2 == "xref":
+        doc.xref_set_key(int(v2.split()[0]), name, "%d 0 R" % xref)
+    else:
+        doc.xref_set_key(target, path + "/" + name, "%d 0 R" % xref)
+    return name
+
+
+def append_contents(doc, page, data):
+    x = doc.get_new_xref()
+    doc.update_object(x, "<<>>")
+    doc.update_stream(x, data, new=True)
+    k, v = doc.xref_get_key(page.xref, "Contents")
+    if k == "xref" and not doc.xref_is_stream(int(v.split()[0])):  # ссылка на массив потоков
+        k, v = "array", doc.xref_object(int(v.split()[0]), compressed=True)
+    if k == "xref":
+        new = "[%s %d 0 R]" % (v, x)
+    elif k == "array":
+        new = v.strip()[:-1] + " %d 0 R]" % x
+    else:
+        new = "%d 0 R" % x
+    doc.xref_set_key(page.xref, "Contents", new)
+
+
+class FontResolver:
+    """Выбор шрифта для фрагмента: исходный → системный с тем же именем → замена."""
+
+    def __init__(self, page):
+        self.doc = page.parent
+        self.glyph_ok = self.doc.xref_get_key(page.xref, "Resources")[0] != "null"
+        self.by_name, self.cache = {}, {}
+        for f in page.get_fonts(full=True):
+            self.by_name.setdefault(norm_font_name(f[3]), []).append((f[0], f[3]))
+
+    def _glyph_font(self, xref, basefont):
+        if xref not in self.cache:
+            self.cache[xref] = GlyphFont(self.doc, xref, basefont)
+        return self.cache[xref]
+
+    def resolve(self, span, text, style=None):
+        """-> (шрифт, пояснение). style=(семейство, жирный, курсив) — явная замена."""
+        if style:
+            return generic_font(*style), ""
+        note = ""
+        if self.glyph_ok:
+            cands = [self._glyph_font(x, b) for x, b in self.by_name.get(norm_font_name(span["font"]), [])]
+            cands = [g for g in cands if g.ok]
+            for g in cands:
+                if g.missing(text):
+                    continue
+                if len(cands) > 1 and g.missing(span["text"].replace("\ufffd", "")):
+                    continue  # несколько одноимённых подмножеств — берём то, где есть исходные буквы
+                return g, ""
+            if cands:
+                note = "в исходном шрифте нет: " + " ".join(cands[0].missing(text)[:12])
+        path = system_font_path(span["font"])
+        if path:
+            f = file_font(path, "system")
+            if not f.missing(text):
+                return f, note
+        return generic_font(*span_style(span)), note
+
+
+def map_edit_to_spans(span_texts, new_full):
+    """Новая строка -> новые тексты фрагментов. Каждая правка (посимвольный дифф) попадает
+    в свой фрагмент, форматирование остальных сохраняется. Правка через границу фрагментов
+    сливает только их."""
+    old = "".join(span_texts)
+    if new_full == old:
+        return list(span_texts)
+    owner = [i for i, t in enumerate(span_texts) for _ in t]
+    out = [""] * len(span_texts)
+    sm = difflib.SequenceMatcher(None, old, new_full, autojunk=False)
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        if tag == "equal":
+            for i in range(i1, i2):
+                out[owner[i]] += old[i]
+        elif i2 > i1:  # замена/удаление: текст уходит в первый затронутый фрагмент
+            out[owner[i1]] += new_full[j1:j2]
+        else:  # вставка продолжает фрагмент слева
+            out[owner[i1 - 1] if i1 > 0 else 0] += new_full[j1:j2]
+    return out
+
+
+def plan_line(resolver, line, new_texts, size=None, color=None, style=None):
+    """Раскладка изменённой строки: что удалить и что нарисовать.
+    Изменённый фрагмент перерисовывается, хвост строки сдвигается на разницу ширины,
+    промежутки между фрагментами сохраняются. -> (области удаления, вывод, пояснения)."""
+    spans, d = line["spans"], line["dir"]
+    O, dv = fitz.Point(spans[0]["origin"]), fitz.Point(d)
+
+    def proj(p):
+        return (p[0] - O.x) * d[0] + (p[1] - O.y) * d[1]
+
+    k = next((i for i, (s, t) in enumerate(zip(spans, new_texts)) if s["text"] != t), None)
+    if k is None:
+        return [], [], []
+    def span_end(s):
+        r = fitz.Rect(s["bbox"])
+        return max(proj(c) for c in (r.tl, r.tr, r.bl, r.br))
+
+    redacts, draws, notes = [], [], []
+    shift = 0.0
+    prev_end = span_end(spans[k - 1]) if k > 0 else None
+    for s, txt in list(zip(spans, new_texts))[k:]:
+        changed = txt != s["text"]
+        r = fitz.Rect(s["bbox"])
+        start, end = proj(s["origin"]), span_end(s)
+        if not changed:
+            if abs(shift) < 0.3:
+                break  # дальше всё стоит на своих местах
+            gap = start - prev_end if prev_end is not None else 0.0
+            if gap > 1.5 * s["size"] and shift < gap - 0.3 * s["size"]:
+                break  # дальше колонка (таблица/табуляция) и места хватает — не двигаем
+        prev_end = end
+        redacts.append(shrink_rect(r, d))
+        new_start = start + shift
+        sz = size or s["size"]
+        if txt.strip():
+            if "\ufffd" in txt:
+                raise ValueError("В строке есть символы, которые не удалось прочитать (�). "
+                                 "Переписать её без искажений нельзя.")
+            spec, note = resolver.resolve(s, txt, style)
+            col = color or int_to_rgb(s["color"])
+            pt = fitz.Point(s["origin"]) + dv * (new_start - start)
+            draws.append((spec, pt, txt, sz, col, d))
+            notes.append((spec, note))
+            new_end = new_start + spec.width(txt.split("\n")[-1], sz)
+        elif txt and not changed:
+            new_end = new_start + (end - start)  # пробельный фрагмент — просто промежуток
+        else:
+            new_end = new_start + len(txt) * sz * 0.25
+        shift = new_end - end
+    return redacts, draws, notes
+
+
+def execute_plan(page, redacts, draws):
+    """Удаляет старые глифы и рисует новые. True — если в PDF вкладывался новый шрифт."""
+    for r in redacts:
+        page.add_redact_annot(r, fill=False)
+    if redacts:
+        remove_text_only(page)
+    batch = TextBatch(page)
+    embedded = False
+    for spec, pt, txt, size, color, d in draws:
+        embedded |= draw_text(spec, page, batch, pt, txt, size, color, d)
+    batch.flush()
+    return embedded
+
+
+def describe_fonts(notes):
+    """Короткий отчёт: каким шрифтом что написано."""
+    kinds = {"orig": "исходный", "system": "системный", "generic": "замена"}
+    seen, parts = set(), []
+    for spec, note in notes:
+        key = (spec.kind, spec.label)
+        if key in seen:
+            continue
+        seen.add(key)
+        parts.append("%s «%s»%s" % (kinds[spec.kind], spec.label, (" — " + note) if note else ""))
+    return "; ".join(parts)
 
 
 # ---------------------------------------------------------- вспомогательные --
@@ -122,7 +738,7 @@ def dlg_color(rgb):
 
 
 def span_style(span):
-    """Определяет семейство/жирность/курсив по шрифту исходного фрагмента."""
+    """Семейство/жирность/курсив по шрифту исходного фрагмента (для замены)."""
     name = span.get("font", "").lower()
     flags = span.get("flags", 0)
     bold = bool(flags & 16) or any(w in name for w in ("bold", "black", "heavy", "semibold"))
@@ -142,18 +758,15 @@ def rotate_from_dir(direction):
     return int(round(ang / 90.0)) * 90 % 360
 
 
-def shrink_rect(rect, direction=(1, 0), k=0.2):
-    """Сужаем область удаления поперёк строки, чтобы не задеть соседние строки."""
+def shrink_rect(rect, direction=(1, 0), k=0.2, along=0.3):
+    """Область удаления чуть уже фрагмента: поперёк строки на 20%, вдоль — на 0.3 pt,
+    чтобы не задеть соседние строки и соседние буквы."""
     r = fitz.Rect(rect)
     if abs(direction[0]) >= abs(direction[1]):
-        d = r.height * k
-        r.y0 += d
-        r.y1 -= d
+        dy, dx = r.height * k, min(along, r.width * 0.1)
     else:
-        d = r.width * k
-        r.x0 += d
-        r.x1 -= d
-    return r
+        dx, dy = r.width * k, min(along, r.height * 0.1)
+    return fitz.Rect(r.x0 + dx, r.y0 + dy, r.x1 - dx, r.y1 - dy)
 
 
 def remove_text_only(page):
@@ -164,47 +777,63 @@ def remove_text_only(page):
         page.apply_redactions(images=IMG_NONE)
 
 
+TEXT_FLAGS = fitz.TEXT_PRESERVE_WHITESPACE | fitz.TEXT_PRESERVE_LIGATURES | fitz.TEXT_MEDIABOX_CLIP
+
+
 def text_lines(page):
-    """Все текстовые строки страницы со стилем первого фрагмента."""
-    out = []
-    for b in page.get_text("dict")["blocks"]:
+    """Визуальные строки страницы со всеми фрагментами (span) — у каждого свой шрифт/размер/цвет.
+    Куски одной строки на общей базовой линии склеиваются (например, после прошлой правки),
+    а далеко разнесённые (колонки таблиц) остаются отдельными строками."""
+    raw = []
+    for b in page.get_text("dict", flags=TEXT_FLAGS)["blocks"]:
         if b.get("type") != 0:
             continue
         for ln in b["lines"]:
-            spans = [s for s in ln["spans"] if s["text"].strip()]
-            if not spans:
-                continue
-            out.append({"bbox": fitz.Rect(ln["bbox"]), "dir": tuple(ln["dir"]),
-                        "text": "".join(s["text"] for s in ln["spans"]).strip(),
-                        "spans": spans})
+            spans = [sp for sp in ln["spans"] if sp["text"]]
+            if spans and "".join(sp["text"] for sp in spans).strip():
+                raw.append({"dir": (round(ln["dir"][0], 3), round(ln["dir"][1], 3)), "spans": spans})
+
+    def coords(ln):
+        dx, dy = ln["dir"]
+        o = ln["spans"][0]["origin"]
+        c = -dy * o[0] + dx * o[1]  # поперёк строки (базовая линия)
+        a0 = min(dx * sp["origin"][0] + dy * sp["origin"][1] for sp in ln["spans"])
+        a1 = max(max(dx * x + dy * y for x in (sp["bbox"][0], sp["bbox"][2]) for y in (sp["bbox"][1], sp["bbox"][3]))
+                 for sp in ln["spans"])
+        return c, a0, a1
+
+    for ln in raw:
+        ln["c"], ln["a0"], ln["a1"] = coords(ln)
+    raw.sort(key=lambda ln: (ln["dir"], ln["c"]))
+    groups = []  # кластеры по базовой линии
+    for ln in raw:
+        size = min(sp["size"] for sp in ln["spans"])
+        g = groups[-1] if groups else None
+        if g and g[-1]["dir"] == ln["dir"] and abs(ln["c"] - g[-1]["c"]) < 0.25 * size:
+            g.append(ln)
+        else:
+            groups.append([ln])
+    out = []
+    for g in groups:
+        g.sort(key=lambda ln: ln["a0"])
+        cur = None
+        for ln in g:
+            size = min(sp["size"] for sp in ln["spans"])
+            if cur is not None and ln["a0"] - cur["a1"] < 1.5 * size:
+                cur["spans"] += ln["spans"]
+                cur["a1"] = max(cur["a1"], ln["a1"])
+            else:
+                cur = dict(ln)
+                cur["spans"] = list(ln["spans"])
+                out.append(cur)
+    for ln in out:
+        dx, dy = ln["dir"]
+        ln["spans"].sort(key=lambda sp: dx * sp["origin"][0] + dy * sp["origin"][1])
+        ln["bbox"] = fitz.Rect()
+        for sp in ln["spans"]:
+            ln["bbox"] |= fitz.Rect(sp["bbox"])
+        ln["raw"] = "".join(sp["text"] for sp in ln["spans"])
     return out
-
-
-def collect_replacements(page, needle):
-    """Находит вхождения needle и для каждого — шрифт, размер, цвет, базовую линию."""
-    hits = page.search_for(needle)
-    if not hits:
-        return [], 0
-    spans = []
-    for ln in text_lines(page):
-        for s in ln["spans"]:
-            spans.append((fitz.Rect(s["bbox"]), s, ln["dir"]))
-    result, skipped = [], 0
-    for h in hits:
-        c = fitz.Point((h.x0 + h.x1) / 2, (h.y0 + h.y1) / 2)
-        best = None
-        for r, s, d in spans:
-            if r.contains(c):
-                best = (s, d)
-                break
-        if best is None or abs(best[1][0]) < 0.99:  # только горизонтальные строки
-            skipped += 1
-            continue
-        s, d = best
-        result.append({"rect": h, "origin": fitz.Point(h.x0, s["origin"][1]),
-                       "size": s["size"], "color": int_to_rgb(s["color"]),
-                       "style": span_style(s), "dir": d})
-    return result, skipped
 
 
 # ------------------------------------------------------------------ диалоги --
@@ -227,10 +856,10 @@ class ColorButton(QPushButton):
 
 class TextDialog(QDialog):
     def __init__(self, parent, title, text="", size=12.0, color=(0, 0, 0),
-                 family="sans", bold=False, italic=False, hint=""):
+                 family="sans", bold=False, italic=False, hint="", original=None):
         super().__init__(parent)
         self.setWindowTitle(title)
-        self.resize(460, 260)
+        self.resize(520, 280)
         lay = QVBoxLayout(self)
         if hint:
             lab = QLabel(hint)
@@ -241,9 +870,11 @@ class TextDialog(QDialog):
         lay.addWidget(self.edit)
         form = QFormLayout()
         self.family = QComboBox()
+        if original:
+            self.family.addItem("Как в оригинале (%s)" % original.split("+", 1)[-1], "orig")
         for key, label in FAMILIES:
             self.family.addItem(label, key)
-        self.family.setCurrentIndex([k for k, _ in FAMILIES].index(family))
+        self.family.setCurrentIndex(max(0, self.family.findData(family)))
         form.addRow("Шрифт:", self.family)
         row = QHBoxLayout()
         self.size = QDoubleSpinBox()
@@ -264,11 +895,18 @@ class TextDialog(QDialog):
         bb.accepted.connect(self.accept)
         bb.rejected.connect(self.reject)
         lay.addWidget(bb)
+        self.family.currentIndexChanged.connect(self._family_changed)
+        self._family_changed()
         self.edit.setFocus()
         self.edit.selectAll()
 
+    def _family_changed(self):
+        orig = self.family.currentData() == "orig"  # начертание берётся из оригинала
+        self.bold.setEnabled(not orig)
+        self.italic.setEnabled(not orig)
+
     def values(self):
-        return dict(text=self.edit.toPlainText().rstrip("\n"), size=self.size.value(),
+        return dict(text=self.edit.toPlainText().rstrip("\n"), size=round(self.size.value(), 1),
                     color=qcolor_rgb(self.color.color), family=self.family.currentData(),
                     bold=self.bold.isChecked(), italic=self.italic.isChecked())
 
@@ -280,12 +918,15 @@ class ReplaceDialog(QDialog):
         form = QFormLayout(self)
         self.find = QLineEdit()
         self.repl = QLineEdit()
+        self.case = QCheckBox("С учётом регистра")
         self.all_pages = QCheckBox("На всех страницах")
         self.all_pages.setChecked(True)
         form.addRow("Найти:", self.find)
         form.addRow("Заменить на:", self.repl)
+        form.addRow("", self.case)
         form.addRow("", self.all_pages)
-        note = QLabel("Поиск без учёта регистра. Пустая замена — просто удалить найденное.")
+        note = QLabel("Пишется исходным шрифтом документа, если в нём есть нужные буквы.\n"
+                      "Остаток строки сдвигается. Пустая замена — удалить найденное.")
         note.setStyleSheet("color:#666;")
         form.addRow(note)
         bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
@@ -1008,38 +1649,53 @@ class Editor(QMainWindow):
 
     def edit_line_at(self, pt):
         page = self._page()
-        line = None
-        for ln in text_lines(page):
-            if ln["bbox"].contains(pt):
-                line = ln
-                break
+        hits = [ln for ln in text_lines(page) if ln["bbox"].contains(pt)]
+        line = min(hits, key=lambda ln: abs(pt - (ln["bbox"].tl + ln["bbox"].br) / 2)) if hits else None
         if line is None:
             self.statusBar().showMessage(
                 "Под курсором нет текста. Если это скан (картинка), текст изменить нельзя — "
                 "используйте «Стереть область» + «Текст».", 6000)
             return
-        s0 = line["spans"][0]
+        spans, raw = line["spans"], line["raw"]
+        i0 = next(i for i, sp in enumerate(spans) if sp["text"].strip())
+        s0 = spans[i0]
         family, bold, italic = span_style(s0)
-        dlg = TextDialog(self, "Изменить строку", line["text"], s0["size"], int_to_rgb(s0["color"]),
-                         family, bold, italic,
-                         hint="Исходный шрифт: %s. Оставьте поле пустым, чтобы удалить строку." % s0["font"])
+        lead, trail = raw[:len(raw) - len(raw.lstrip())], raw[len(raw.rstrip()):]
+        hint = ("Если не менять шрифт, размер и цвет — переписан будет только изменённый фрагмент, "
+                "остальное форматирование строки сохранится. Пустое поле — удалить строку.")
+        if "\ufffd" in raw:
+            hint += "\n⚠ В строке есть нечитаемые символы (�) — они не сохранятся."
+        dlg = TextDialog(self, "Изменить строку", raw.strip(), s0["size"], int_to_rgb(s0["color"]),
+                         "orig", bold, italic, hint=hint, original=s0["font"])
         if dlg.exec() != QDialog.Accepted:
             return
         v = dlg.values()
-        before = dict(text=line["text"], size=round(s0["size"], 1), family=family, bold=bold, italic=italic)
-        if all(v[k] == before[k] for k in before) and v["color"] == dlg_color(int_to_rgb(s0["color"])):
+        same_look = (v["family"] == "orig" and v["size"] == round(s0["size"], 1)
+                     and v["color"] == dlg_color(int_to_rgb(s0["color"])))
+        if same_look and v["text"] == raw.strip():
             return  # ничего не поменяли
-        origin = fitz.Point(s0["origin"])
-        direction = line["dir"]
+        resolver = FontResolver(page)
+        n = len(spans)
+        try:
+            if not v["text"].strip():
+                plan = plan_line(resolver, line, [""] * n)
+            elif same_look and "\n" not in v["text"]:
+                new_texts = map_edit_to_spans([sp["text"] for sp in spans], lead + v["text"] + trail)
+                plan = plan_line(resolver, line, new_texts)
+            else:  # другой стиль или несколько строк — вся строка одним стилем
+                new_texts = [""] * n
+                new_texts[i0] = v["text"]
+                style = None if v["family"] == "orig" else (v["family"], v["bold"], v["italic"])
+                plan = plan_line(resolver, line, new_texts, size=v["size"], color=v["color"], style=style)
+        except ValueError as ex:
+            QMessageBox.warning(self, APP_NAME, str(ex))
+            return
 
         def fn():
-            page.add_redact_annot(shrink_rect(line["bbox"], direction), fill=False)
-            remove_text_only(page)
-            if v["text"].strip():
-                put_text(page, origin, v["text"], v["size"], v["color"], v["family"],
-                         v["bold"], v["italic"], rotate=rotate_from_dir(direction))
+            if execute_plan(page, plan[0], plan[1]):
                 self.text_added = True
-        self.apply(fn)
+        if self.apply(fn) and plan[2]:
+            self.statusBar().showMessage("Шрифт: " + describe_fonts(plan[2]), 10000)
 
     def on_drag(self, tool, data):
         page = self._page()
@@ -1123,35 +1779,50 @@ class Editor(QMainWindow):
         if dlg.exec() != QDialog.Accepted:
             return
         needle, repl = dlg.find.text(), dlg.repl.text()
-        if not needle.strip():
+        if not needle:
             return
+        rx = re.compile(re.escape(needle), 0 if dlg.case.isChecked() else re.IGNORECASE)
         pages = range(len(self.doc)) if dlg.all_pages.isChecked() else [self.cur]
-        plan, skipped = {}, 0
-        for i in pages:
-            items, sk = collect_replacements(self.doc[i], needle)
-            skipped += sk
-            if items:
-                plan[i] = items
-        total = sum(len(v) for v in plan.values())
+        plans, total, notes = [], 0, []
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            for i in pages:
+                page = self.doc[i]
+                resolver, redacts, draws = None, [], []
+                for line in text_lines(page):
+                    texts = [sp["text"] for sp in line["spans"]]
+                    cnt = len(rx.findall(line["raw"]))
+                    if not cnt:
+                        continue
+                    if resolver is None:
+                        resolver = FontResolver(page)
+                    new_texts = [rx.sub(lambda m: repl, t) for t in texts]
+                    if sum(len(rx.findall(t)) for t in texts) != cnt:  # вхождение на стыке фрагментов
+                        new_texts = map_edit_to_spans(texts, rx.sub(lambda m: repl, line["raw"]))
+                    r, d, nt = plan_line(resolver, line, new_texts)
+                    redacts += r
+                    draws += d
+                    notes += nt
+                    total += cnt
+                if redacts:
+                    plans.append((page, redacts, draws))
+        except ValueError as ex:
+            QApplication.restoreOverrideCursor()
+            QMessageBox.warning(self, APP_NAME, str(ex))
+            return
+        QApplication.restoreOverrideCursor()
         if not total:
             QMessageBox.information(self, APP_NAME, "Текст «%s» не найден." % needle)
             return
 
         def fn():
-            for i, items in plan.items():
-                page = self.doc[i]
-                for it in items:
-                    page.add_redact_annot(shrink_rect(it["rect"], it["dir"]), fill=False)
-                remove_text_only(page)
-                if repl:
-                    for it in items:
-                        fam, b, ital = it["style"]
-                        put_text(page, it["origin"], repl, it["size"], it["color"], fam, b, ital)
+            for page, redacts, draws in plans:
+                if execute_plan(page, redacts, draws):
                     self.text_added = True
         if self.apply(fn, structural=True):
-            msg = "Заменено: %d на %d стр." % (total, len(plan))
-            if skipped:
-                msg += "\nПропущено (вертикальный текст): %d" % skipped
+            msg = "Заменено: %d на %d стр." % (total, len(plans))
+            if notes:
+                msg += "\n\nШрифт: " + describe_fonts(notes).replace("; ", "\n")
             QMessageBox.information(self, APP_NAME, msg)
 
 
